@@ -96779,7 +96779,6 @@ var StdioServerTransport = class {
 // server.js
 var import_imapflow = __toESM(require_imap_flow(), 1);
 var import_nodemailer = __toESM(require_nodemailer(), 1);
-var import_mailparser = __toESM(require_mailparser(), 1);
 import { readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -96825,13 +96824,60 @@ if (!CONFIG.username || !CONFIG.password) {
   );
   process.exit(1);
 }
-var IMAP_IDLE_TIMEOUT_MS = parseInt(process.env.PROTON_BRIDGE_IDLE_TIMEOUT_MS || "300000", 10);
-var SMTP_IDLE_TIMEOUT_MS = parseInt(process.env.PROTON_BRIDGE_SMTP_IDLE_TIMEOUT_MS || "120000", 10);
+var IMAP_IDLE_TIMEOUT_MS = parseInt(process.env.PROTON_BRIDGE_IDLE_TIMEOUT_MS || "60000", 10);
+var SMTP_IDLE_TIMEOUT_MS = parseInt(process.env.PROTON_BRIDGE_SMTP_IDLE_TIMEOUT_MS || "30000", 10);
+var DEFAULT_MAX_BODY_CHARS = 2e4;
+var parsedMaxBodyChars = parseInt(process.env.PROTON_MCP_MAX_BODY_CHARS || `${DEFAULT_MAX_BODY_CHARS}`, 10);
+var MAX_BODY_CHARS = Number.isFinite(parsedMaxBodyChars) && parsedMaxBodyChars >= 0 ? parsedMaxBodyChars : DEFAULT_MAX_BODY_CHARS;
+var SHUTDOWN_FORCE_EXIT_MS = 1500;
+var DEBUG_ENABLED = process.env.PROTON_MCP_DEBUG === "1";
 var imapClient = null;
 var imapClientPromise = null;
 var imapIdleTimer = null;
 var smtpTransport = null;
 var smtpIdleTimer = null;
+var server = null;
+var transport = null;
+var shutdownStarted = false;
+function getActiveCount(getterName) {
+  try {
+    const getter = process[getterName];
+    return typeof getter === "function" ? getter.call(process).length : null;
+  } catch {
+    return null;
+  }
+}
+function safeErrorInfo(error) {
+  if (!error) return void 0;
+  return {
+    name: error?.name || "Error",
+    code: error?.code || error?.errno || void 0
+  };
+}
+function debugLog(event, fields = {}) {
+  if (!DEBUG_ENABLED) {
+    return;
+  }
+  const memory = process.memoryUsage();
+  const entry = {
+    event,
+    pid: process.pid,
+    ppid: process.ppid,
+    uptimeMs: Math.round(process.uptime() * 1e3),
+    rss: memory.rss,
+    heapUsed: memory.heapUsed,
+    heapTotal: memory.heapTotal,
+    external: memory.external,
+    arrayBuffers: memory.arrayBuffers,
+    activeHandles: getActiveCount("_getActiveHandles"),
+    activeRequests: getActiveCount("_getActiveRequests"),
+    ...fields
+  };
+  try {
+    console.error(`[proton-mcp] ${JSON.stringify(entry)}`);
+  } catch {
+  }
+}
 function clearIdleTimer(timer) {
   if (timer) {
     clearTimeout(timer);
@@ -96843,6 +96889,7 @@ function unrefTimer(timer) {
   }
 }
 function createImapClient() {
+  debugLog("imap_create");
   const client = new import_imapflow.ImapFlow({
     host: CONFIG.host,
     port: CONFIG.imapPort,
@@ -96858,6 +96905,7 @@ function createImapClient() {
     logger: false
   });
   client.on("close", () => {
+    debugLog("imap_close");
     if (imapClient === client) {
       imapClient = null;
       imapClientPromise = null;
@@ -96880,6 +96928,7 @@ function scheduleImapDisconnect() {
     if (imapClient !== client) {
       return;
     }
+    debugLog("imap_idle_close");
     imapClient = null;
     imapClientPromise = null;
     try {
@@ -96900,6 +96949,7 @@ function scheduleImapDisconnect() {
 function resetImapClient(client = imapClient) {
   clearIdleTimer(imapIdleTimer);
   imapIdleTimer = null;
+  debugLog("imap_reset");
   if (client && imapClient === client) {
     imapClient = null;
   }
@@ -96927,9 +96977,11 @@ async function getImapClient() {
       const client = createImapClient();
       try {
         await client.connect();
+        debugLog("imap_connected");
         imapClient = client;
         return client;
       } catch (error) {
+        debugLog("imap_connect_failed", { error: safeErrorInfo(error) });
         if (imapClient === client) {
           imapClient = null;
         }
@@ -96977,7 +97029,128 @@ function formatAddress(addr) {
   }
   return addr.address || "";
 }
+function formatAddressList(addresses) {
+  if (!addresses) return "";
+  if (Array.isArray(addresses)) {
+    return addresses.map((addr) => formatAddress(addr)).filter(Boolean).join(", ");
+  }
+  return formatAddress(addresses);
+}
+function walkBodyParts(node, parts = []) {
+  if (!node) return parts;
+  if (Array.isArray(node.childNodes) && node.childNodes.length) {
+    for (const child of node.childNodes) {
+      walkBodyParts(child, parts);
+    }
+    return parts;
+  }
+  parts.push(node);
+  return parts;
+}
+function getBodyPartFilename(part) {
+  return part?.dispositionParameters?.filename || part?.parameters?.name || part?.parameters?.filename || null;
+}
+function isAttachmentPart(part) {
+  const disposition = `${part?.disposition || ""}`.toLowerCase();
+  return disposition === "attachment" || !!getBodyPartFilename(part);
+}
+function getAttachmentMetadata(bodyStructure) {
+  return walkBodyParts(bodyStructure).filter(isAttachmentPart).map((part) => ({
+    filename: getBodyPartFilename(part),
+    contentType: part.type || null,
+    size: part.size || null
+  }));
+}
+function getTextBodyPart(bodyStructure) {
+  const bodyParts = walkBodyParts(bodyStructure).filter((part) => !isAttachmentPart(part));
+  return bodyParts.find((part) => `${part.type || ""}`.toLowerCase() === "text/plain") || bodyParts.find((part) => `${part.type || ""}`.toLowerCase().startsWith("text/")) || null;
+}
+async function streamToLimitedText(stream, maxChars) {
+  let text = "";
+  let byteLength = 0;
+  let truncated = false;
+  for await (const chunk of stream) {
+    const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    byteLength += buffer.length;
+    text += buffer.toString("utf8");
+    if (text.length > maxChars) {
+      text = text.slice(0, maxChars);
+      truncated = true;
+      if (typeof stream.destroy === "function") {
+        stream.destroy();
+      }
+      break;
+    }
+  }
+  return {
+    text,
+    byteLength,
+    textTruncated: truncated,
+    textOriginalLength: text.length
+  };
+}
+async function fetchPlainTextBody(client, uid, bodyStructure) {
+  if (MAX_BODY_CHARS === 0) {
+    return {
+      text: "",
+      textTruncated: true,
+      textOriginalLength: 0
+    };
+  }
+  const textPart = getTextBodyPart(bodyStructure);
+  if (!textPart) {
+    return {
+      text: "",
+      textTruncated: false,
+      textOriginalLength: 0
+    };
+  }
+  const part = textPart.part || "1";
+  const maxBytes = Math.max(MAX_BODY_CHARS * 4, 1024);
+  const { meta, content } = await client.download(`${uid}`, part, {
+    uid: true,
+    maxBytes: maxBytes + 1
+  });
+  if (!content) {
+    return {
+      text: "",
+      textTruncated: false,
+      textOriginalLength: 0
+    };
+  }
+  const body = await streamToLimitedText(content, MAX_BODY_CHARS);
+  const sizeHint = Number(meta?.expectedSize || textPart.size || 0);
+  const wasByteLimited = body.byteLength > maxBytes || sizeHint > maxBytes;
+  return {
+    text: body.text,
+    textTruncated: body.textTruncated || wasByteLimited,
+    textOriginalLength: body.textTruncated || wasByteLimited ? null : body.text.length
+  };
+}
+function extractHeader(headers, name) {
+  const raw = Buffer.isBuffer(headers) ? headers.toString("utf8") : `${headers || ""}`;
+  const target = name.toLowerCase();
+  let current = "";
+  let value = "";
+  for (const line of raw.split(/\r?\n/)) {
+    if (/^\s/.test(line) && current === target) {
+      value += ` ${line.trim()}`;
+      continue;
+    }
+    const colon = line.indexOf(":");
+    if (colon === -1) {
+      current = "";
+      continue;
+    }
+    current = line.slice(0, colon).trim().toLowerCase();
+    if (current === target) {
+      value = line.slice(colon + 1).trim();
+    }
+  }
+  return value;
+}
 function createSmtpTransport() {
+  debugLog("smtp_create");
   return import_nodemailer.default.createTransport({
     host: CONFIG.host,
     port: CONFIG.smtpPort,
@@ -97011,8 +97184,10 @@ function scheduleSmtpClose() {
     if (smtpTransport !== transport2) {
       return;
     }
+    debugLog("smtp_idle_close");
     smtpTransport = null;
     try {
+      debugLog("smtp_close", { reason: "idle" });
       transport2.close();
     } catch {
     }
@@ -97022,12 +97197,14 @@ function scheduleSmtpClose() {
 function resetSmtpTransport() {
   clearIdleTimer(smtpIdleTimer);
   smtpIdleTimer = null;
+  debugLog("smtp_reset");
   if (!smtpTransport) {
     return;
   }
   const transport2 = smtpTransport;
   smtpTransport = null;
   try {
+    debugLog("smtp_close", { reason: "reset" });
     transport2.close();
   } catch {
   }
@@ -97047,6 +97224,7 @@ async function sendMail(mailOptions) {
     scheduleSmtpClose();
     return info;
   } catch (error) {
+    debugLog("smtp_send_failed", { error: safeErrorInfo(error), retryable: isRetryableSmtpError(error) });
     if (!isRetryableSmtpError(error)) {
       scheduleSmtpClose();
       throw error;
@@ -97058,6 +97236,7 @@ async function sendMail(mailOptions) {
       scheduleSmtpClose();
       return info;
     } catch (retryError) {
+      debugLog("smtp_send_retry_failed", { error: safeErrorInfo(retryError), retryable: isRetryableSmtpError(retryError) });
       if (isRetryableSmtpError(retryError)) {
         resetSmtpTransport();
       } else {
@@ -97068,13 +97247,22 @@ async function sendMail(mailOptions) {
   }
 }
 async function shutdownResources() {
+  debugLog("resources_shutdown_start");
   clearIdleTimer(imapIdleTimer);
   clearIdleTimer(smtpIdleTimer);
   imapIdleTimer = null;
   smtpIdleTimer = null;
-  const client = imapClient;
+  const pendingClientPromise = imapClientPromise;
+  let client = imapClient;
   imapClient = null;
   imapClientPromise = null;
+  if (!client && pendingClientPromise) {
+    try {
+      client = await pendingClientPromise;
+    } catch (error) {
+      debugLog("imap_pending_connect_failed", { error: safeErrorInfo(error) });
+    }
+  }
   if (client) {
     try {
       if (client.usable) {
@@ -97087,16 +97275,73 @@ async function shutdownResources() {
         client.close();
       } catch {
       }
+    } finally {
+      if (imapClient === client) {
+        imapClient = null;
+      }
+      imapClientPromise = null;
     }
   }
   resetSmtpTransport();
+  debugLog("resources_shutdown_complete");
+}
+async function shutdown(reason = "unknown", exitCode = 0, error) {
+  if (shutdownStarted) {
+    return;
+  }
+  shutdownStarted = true;
+  debugLog("shutdown_start", { reason, exitCode, error: safeErrorInfo(error) });
+  const forceExitTimer = typeof exitCode === "number" ? setTimeout(() => {
+    debugLog("shutdown_force_exit", { reason, exitCode });
+    process.exit(exitCode);
+  }, SHUTDOWN_FORCE_EXIT_MS) : null;
+  unrefTimer(forceExitTimer);
+  try {
+    await shutdownResources();
+    try {
+      if (server && typeof server.close === "function") {
+        await server.close();
+      }
+    } catch (closeError) {
+      debugLog("server_close_failed", { error: safeErrorInfo(closeError) });
+    }
+    try {
+      if (transport && typeof transport.close === "function") {
+        await transport.close();
+      }
+    } catch (closeError) {
+      debugLog("transport_close_failed", { error: safeErrorInfo(closeError) });
+    }
+    debugLog("shutdown_complete", { reason, exitCode });
+  } finally {
+    clearIdleTimer(forceExitTimer);
+  }
+  if (typeof exitCode === "number") {
+    process.exit(exitCode);
+  }
 }
 for (const signal of ["SIGINT", "SIGTERM"]) {
   process.once(signal, () => {
-    shutdownResources().finally(() => process.exit(0));
+    void shutdown(signal, 0);
   });
 }
-process.once("exit", () => {
+process.stdin.once("end", () => {
+  void shutdown("stdin_end", 0);
+});
+process.stdin.once("close", () => {
+  void shutdown("stdin_close", 0);
+});
+process.stdin.once("error", (error) => {
+  void shutdown("stdin_error", 1, error);
+});
+process.once("uncaughtException", (error) => {
+  void shutdown("uncaught_exception", 1, error);
+});
+process.once("unhandledRejection", (error) => {
+  void shutdown("unhandled_rejection", 1, error);
+});
+process.once("exit", (code) => {
+  debugLog("process_exit", { code });
   clearIdleTimer(imapIdleTimer);
   clearIdleTimer(smtpIdleTimer);
   try {
@@ -97108,10 +97353,46 @@ process.once("exit", () => {
   } catch {
   }
 });
-var server = new McpServer({
+debugLog("startup", {
+  imapIdleTimeoutMs: IMAP_IDLE_TIMEOUT_MS,
+  smtpIdleTimeoutMs: SMTP_IDLE_TIMEOUT_MS,
+  maxBodyChars: MAX_BODY_CHARS
+});
+server = new McpServer({
   name: "proton-mail",
   version: "0.1.0"
 });
+var registerTool = server.tool.bind(server);
+server.tool = function(...args) {
+  const callbackIndex = args.findIndex((arg) => typeof arg === "function");
+  if (callbackIndex === -1) {
+    return registerTool(...args);
+  }
+  const toolName = `${args[0] || "unknown"}`;
+  const callback = args[callbackIndex];
+  args[callbackIndex] = async (...callbackArgs) => {
+    const startedAt = Date.now();
+    debugLog("tool_start", { tool: toolName });
+    try {
+      const result = await callback(...callbackArgs);
+      debugLog("tool_end", {
+        tool: toolName,
+        durationMs: Date.now() - startedAt,
+        success: true
+      });
+      return result;
+    } catch (toolError) {
+      debugLog("tool_end", {
+        tool: toolName,
+        durationMs: Date.now() - startedAt,
+        success: false,
+        error: safeErrorInfo(toolError)
+      });
+      throw toolError;
+    }
+  };
+  return registerTool(...args);
+};
 server.tool(
   "list_folders",
   "List all mailbox folders (INBOX, Sent, Drafts, Trash, etc.)",
@@ -97205,25 +97486,25 @@ server.tool(
       const lock = await client.getMailboxLock(folder);
       try {
         const rawMessage = await client.fetchOne(`${uid}`, {
-          source: true,
+          envelope: true,
+          bodyStructure: true,
           uid: true
         }, { uid: true });
-        const parsed = await (0, import_mailparser.simpleParser)(rawMessage.source);
+        const envelope = rawMessage?.envelope || {};
+        const body = await fetchPlainTextBody(client, uid, rawMessage?.bodyStructure);
         const result = {
           uid,
-          subject: parsed.subject || "(no subject)",
-          from: formatAddress(parsed.from),
-          to: formatAddress(parsed.to),
-          cc: formatAddress(parsed.cc),
-          date: parsed.date?.toISOString() || null,
-          messageId: parsed.messageId || null,
-          inReplyTo: parsed.inReplyTo || null,
-          text: parsed.text || "",
-          attachments: (parsed.attachments || []).map((a) => ({
-            filename: a.filename,
-            contentType: a.contentType,
-            size: a.size
-          }))
+          subject: envelope.subject || "(no subject)",
+          from: formatAddressList(envelope.from),
+          to: formatAddressList(envelope.to),
+          cc: formatAddressList(envelope.cc),
+          date: envelope.date?.toISOString() || null,
+          messageId: envelope.messageId || null,
+          inReplyTo: envelope.inReplyTo || null,
+          text: body.text,
+          textTruncated: body.textTruncated,
+          textOriginalLength: body.textOriginalLength,
+          attachments: getAttachmentMetadata(rawMessage?.bodyStructure)
         };
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }]
@@ -97354,11 +97635,20 @@ server.tool(
     const original = await withImapClient(async (client) => {
       const lock = await client.getMailboxLock(folder);
       try {
-        const rawMessage = await client.fetchOne(`${uid}`, {
-          source: true,
+        const originalMessage = await client.fetchOne(`${uid}`, {
+          envelope: true,
+          headers: ["references"],
           uid: true
         }, { uid: true });
-        return await (0, import_mailparser.simpleParser)(rawMessage.source);
+        const envelope = originalMessage?.envelope || {};
+        return {
+          subject: envelope.subject || "",
+          from: formatAddressList(envelope.replyTo?.length ? envelope.replyTo : envelope.from),
+          to: formatAddressList(envelope.to),
+          cc: formatAddressList(envelope.cc),
+          messageId: envelope.messageId || null,
+          references: extractHeader(originalMessage?.headers, "references")
+        };
       } finally {
         lock.release();
       }
@@ -97509,8 +97799,12 @@ server.tool(
       }
     })
 );
-var transport = new StdioServerTransport();
+transport = new StdioServerTransport();
+transport.onclose = () => {
+  void shutdown("transport_close", 0);
+};
 await server.connect(transport);
+debugLog("mcp_connected");
 /*! Bundled license information:
 
 he/he.js:
