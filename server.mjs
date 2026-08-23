@@ -96780,6 +96780,7 @@ var StdioServerTransport = class {
 var import_imapflow = __toESM(require_imap_flow(), 1);
 var import_nodemailer = __toESM(require_nodemailer(), 1);
 var import_mailparser = __toESM(require_mailparser(), 1);
+var { htmlToText: htmlToTextFallback } = require_html_to_text();
 import { readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
@@ -97218,7 +97219,7 @@ server.tool(
           date: parsed.date?.toISOString() || null,
           messageId: parsed.messageId || null,
           inReplyTo: parsed.inReplyTo || null,
-          text: parsed.text || "",
+          text: parsed.text || (parsed.html ? htmlToTextFallback(parsed.html, { wordwrap: false }) : ""),
           attachments: (parsed.attachments || []).map((a) => ({
             filename: a.filename,
             contentType: a.contentType,
