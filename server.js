@@ -14,7 +14,8 @@ import {
   assertTotalSize,
   resolveMessageUid,
   resolveWritePath,
-  writeFileGuarded
+  writeFileGuarded,
+  bodyParts
 } from "./compose.js";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -271,6 +272,7 @@ async function fetchParsedMessage(ref, folder) {
   });
 }
 function buildReplyMailOptions(original, body, html, replyAll) {
+  const parts = bodyParts(body, html);
   const fromAddresses = original.from?.value || [];
   const replyTo = fromAddresses.length > 0 ? fromAddresses.map(formatRecipient).join(", ") : formatAddress(original.from);
   let recipients = replyTo;
@@ -299,11 +301,11 @@ function buildReplyMailOptions(original, body, html, replyAll) {
     from: CONFIG.username,
     to: recipients,
     subject: subjectLine,
-    text: body,
+    text: parts.text,
+    html: parts.html,
     inReplyTo: original.messageId,
     references: references || void 0
   };
-  if (html) mailOptions.html = html;
   return mailOptions;
 }
 async function saveDraft(mailOptions) {
@@ -779,20 +781,21 @@ server.tool(
     to: z.string().describe("Recipient email address(es), comma-separated"),
     subject: z.string().describe("Email subject line"),
     body: z.string().describe("Email body (plain text)"),
-    html: z.string().optional().describe("Optional HTML version of the body"),
+    html: z.string().optional().describe("HTML version of the body. Optional: when omitted, one is generated from the plain text, so the message always has an HTML part. Pass it to control the formatting yourself"),
     cc: z.string().optional().describe("CC recipients, comma-separated"),
     bcc: z.string().optional().describe("BCC recipients, comma-separated"),
     attachments: attachmentsParam
   },
   async ({ to, subject, body, html, cc, bcc, attachments }) => {
     const files = await loadAttachments(attachments);
+    const parts = bodyParts(body, html);
     const mailOptions = {
       from: CONFIG.username,
       to,
       subject,
-      text: body
+      text: parts.text,
+      html: parts.html
     };
-    if (html) mailOptions.html = html;
     if (cc) mailOptions.cc = cc;
     if (bcc) mailOptions.bcc = bcc;
     if (files.length) mailOptions.attachments = toMailAttachments(files);
@@ -825,7 +828,7 @@ server.tool(
     ...messageRefShape("to reply to"),
     folder: z.string().default("INBOX").describe("Folder the original email is in"),
     body: z.string().describe("Reply body (plain text)"),
-    html: z.string().optional().describe("Optional HTML version of the reply"),
+    html: z.string().optional().describe("HTML version of the reply. Optional: when omitted, one is generated from the plain text, so the reply always has an HTML part. Pass it to control the formatting yourself"),
     replyAll: z.boolean().default(false).describe("Reply to all recipients (default: false)"),
     attachments: attachmentsParam
   },
@@ -934,20 +937,21 @@ if (ALLOW_SEND) {
       to: z.string().describe("Recipient email address(es), comma-separated"),
       subject: z.string().describe("Email subject line"),
       body: z.string().describe("Email body (plain text)"),
-      html: z.string().optional().describe("Optional HTML version of the body"),
+      html: z.string().optional().describe("HTML version of the body. Optional: when omitted, one is generated from the plain text, so the message always has an HTML part. Pass it to control the formatting yourself"),
       cc: z.string().optional().describe("CC recipients, comma-separated"),
       bcc: z.string().optional().describe("BCC recipients, comma-separated"),
       attachments: attachmentsParam
     },
     async ({ to, subject, body, html, cc, bcc, attachments }) => {
       const files = await loadAttachments(attachments);
+      const parts = bodyParts(body, html);
       const mailOptions = {
         from: CONFIG.username,
         to,
         subject,
-        text: body
+        text: parts.text,
+        html: parts.html
       };
-      if (html) mailOptions.html = html;
       if (cc) mailOptions.cc = cc;
       if (bcc) mailOptions.bcc = bcc;
       if (files.length) mailOptions.attachments = toMailAttachments(files);
@@ -978,7 +982,7 @@ if (ALLOW_SEND) {
       ...messageRefShape("to reply to"),
       folder: z.string().default("INBOX").describe("Folder the original email is in"),
       body: z.string().describe("Reply body (plain text)"),
-      html: z.string().optional().describe("Optional HTML version of the reply"),
+      html: z.string().optional().describe("HTML version of the reply. Optional: when omitted, one is generated from the plain text, so the reply always has an HTML part. Pass it to control the formatting yourself"),
       replyAll: z.boolean().default(false).describe("Reply to all recipients (default: false)"),
       attachments: attachmentsParam
     },

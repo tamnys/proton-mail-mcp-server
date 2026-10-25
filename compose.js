@@ -14,6 +14,32 @@ export function expandHome(path) {
   return path;
 }
 
+// Proton shows a message with no HTML part as preformatted plain text, in a
+// different font from every other message in the mailbox. So every message
+// this server composes carries an HTML part: the caller's own where it
+// supplied one, otherwise one built from the plain text. The plain text is
+// kept alongside it, giving a normal multipart/alternative that still reads
+// correctly in a client that wants text.
+const HTML_ESCAPES = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" };
+
+// Blank lines become paragraphs, single newlines become line breaks. Nothing
+// else is interpreted, so whatever the caller wrote arrives as written.
+export function plainTextToHtml(text) {
+  const escaped = String(text ?? "").replace(/[&<>"]/g, (character) => HTML_ESCAPES[character]);
+  const paragraphs = escaped
+    .split(/\r?\n[ \t]*\r?\n/)
+    .map((paragraph) => paragraph.replace(/\r?\n/g, "<br>\n").trim())
+    .filter((paragraph) => paragraph.length > 0);
+  return paragraphs.length > 0 ? paragraphs.map((p) => `<p>${p}</p>`).join("\n") : "<p></p>";
+}
+
+// The text and html parts of a message body. `html` is always set.
+export function bodyParts(body, html) {
+  const text = typeof body === "string" ? body : "";
+  const supplied = typeof html === "string" && html.trim().length > 0;
+  return { text, html: supplied ? html : plainTextToHtml(text) };
+}
+
 export function formatBytes(bytes) {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} kB`;
@@ -130,8 +156,10 @@ export function composeDraftUpdate(parsed, changes = {}, newAttachments = [], { 
     html = changes.html || null;
     text = changes.body !== undefined ? changes.body : (html ? htmlToPlainText(html) : "");
   } else if (changes.body !== undefined) {
+    // A new body used to turn the draft into plain text; it now carries an
+    // HTML part built from that body, like every other message composed here.
     text = changes.body;
-    html = null;
+    html = plainTextToHtml(text);
   }
   const keepAttachments = changes.keepAttachments !== false;
   const kept = (parsed.attachments || []).filter((attachment) => {

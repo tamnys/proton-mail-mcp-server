@@ -7,6 +7,8 @@ import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { simpleParser } from "mailparser";
 
 import {
+  plainTextToHtml,
+  bodyParts,
   loadAttachmentFiles,
   assertTotalSize,
   composeDraftUpdate,
@@ -176,12 +178,14 @@ test("updating only the html keeps recipients, subject, threading and attachment
   assert.match(reparsed.html, /cid:logo@x/);
 });
 
-test("a new body without html makes the draft plain text", async () => {
+test("a new body without html still produces an html part", async () => {
   const parsed = await replyDraft();
   const { mailOptions, attachments } = composeDraftUpdate(parsed, { body: "Alleen tekst" });
   assert.equal(mailOptions.text, "Alleen tekst");
-  assert.equal(mailOptions.html, undefined);
-  // The inline logo belonged to the html that is gone; the pdf stays.
+  // Replacing the body used to leave the draft as plain text, which Proton
+  // renders in a different font from every other message.
+  assert.equal(mailOptions.html, "<p>Alleen tekst</p>");
+  // The inline logo belonged to the html that was replaced; the pdf stays.
   assert.deepEqual(attachments.map((a) => a.filename), ["offerte.pdf"]);
 });
 
@@ -362,4 +366,38 @@ test("hasAttachments sees attached files, also when sent inline with a name", ()
     type: "multipart/mixed",
     childNodes: [{ type: "text/plain" }, { type: "text/plain", parameters: { name: "notities.txt" } }]
   }), true);
+});
+
+test("plainTextToHtml turns blank lines into paragraphs and newlines into breaks", () => {
+  assert.equal(
+    plainTextToHtml("Hoi Jan,\n\nRegel een\nRegel twee"),
+    "<p>Hoi Jan,</p>\n<p>Regel een<br>\nRegel twee</p>"
+  );
+});
+
+test("plainTextToHtml escapes what would otherwise be markup", () => {
+  assert.equal(plainTextToHtml('a < b & c "d"'), "<p>a &lt; b &amp; c &quot;d&quot;</p>");
+  // A body that reads like html must not become html.
+  assert.match(plainTextToHtml("<script>alert(1)</script>"), /&lt;script&gt;/);
+});
+
+test("plainTextToHtml always yields an element, even for nothing", () => {
+  for (const empty of ["", "   ", "\n\n", undefined, null]) {
+    assert.match(plainTextToHtml(empty), /^<p>/);
+  }
+});
+
+test("bodyParts keeps html the caller supplied, untouched", () => {
+  const supplied = '<div class="x"><b>Hoi</b></div>';
+  assert.deepEqual(bodyParts("Hoi", supplied), { text: "Hoi", html: supplied });
+});
+
+test("bodyParts builds html when the caller supplied none", () => {
+  // This is the guarantee: no message composed here goes out as plain text
+  // only, whatever the caller remembered to pass.
+  for (const missing of [undefined, null, "", "   "]) {
+    const parts = bodyParts("Hoi Jan", missing);
+    assert.equal(parts.text, "Hoi Jan");
+    assert.equal(parts.html, "<p>Hoi Jan</p>");
+  }
 });
