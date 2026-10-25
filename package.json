@@ -15,6 +15,7 @@
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "1.29.0",
+    "@napi-rs/canvas": "1.0.13",
     "html-to-text": "10.0.0",
     "imapflow": "1.4.8",
     "mailparser": "3.9.14",

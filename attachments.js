@@ -1,5 +1,6 @@
 import { htmlToPlainText } from "./body.js";
 import { extractPdfText } from "./pdf-text.js";
+import { renderPdfPages, DEFAULT_RENDER_PAGES, MAX_RENDER_PAGES } from "./pdf-render.js";
 
 // Attachments whose contents are text a reader can use directly. These are
 // inlined into the read_email response, so an invite's date or a CSV's rows
@@ -223,7 +224,8 @@ async function withPdfText(entry, attachment, { maxTextBytes, maxPdfBytes }) {
     return {
       ...result,
       content: null,
-      note: "PDF has no text layer (likely a scanned image); text extraction is not possible"
+      scanned: true,
+      note: "PDF has no text layer (likely a scanned image); read_attachment returns its pages as images instead"
     };
   }
   const { text, truncated } = truncateText(extracted.text, maxTextBytes);
@@ -272,7 +274,10 @@ export async function describeAttachments(parsed, {
   return Promise.all((parsed?.attachments || []).map(async (attachment, index) => {
     const entry = baseEntry(attachment, index);
     if (isPdfAttachment(attachment)) {
-      return withPdfText(entry, attachment, { maxTextBytes: maxInlineBytes, maxPdfBytes });
+      // `scanned` steers attachmentContent; the listing says the same thing in
+      // its note, so the internal marker does not belong in the output.
+      const { scanned, ...described } = await withPdfText(entry, attachment, { maxTextBytes: maxInlineBytes, maxPdfBytes });
+      return described;
     }
     if (!isInlineTextType(entry.contentType)) return entry;
     if (entry.size > maxInlineBytes) {
@@ -327,11 +332,50 @@ export function findAttachment(parsed, { index, filename } = {}) {
 }
 
 // Build the MCP content blocks for read_attachment.
+// Turn a scanned PDF into page images. Rendering failures become a note, the
+// way text-extraction failures do, so one unreadable attachment never takes
+// down the call that asked for it.
+async function renderedPdf(entry, attachment, { renderPages, renderWidth }) {
+  const json = (obj) => ({ type: "text", text: JSON.stringify(obj, null, 2) });
+  let rendered;
+  try {
+    rendered = await renderPdfPages(attachment.content, { pages: renderPages, width: renderWidth });
+  } catch (error) {
+    return [json({ ...entry, note: `pages not rendered: ${error.message}` })];
+  }
+  if (rendered.images.length === 0) {
+    return [json({ ...entry, note: "no pages matched the requested range" })];
+  }
+  const shown = rendered.images.map((image) => image.page);
+  const missing = rendered.pageCount - shown.length;
+  const asked = renderPages !== undefined && renderPages !== null && renderPages !== "";
+  const result = {
+    ...entry,
+    renderedPages: shown,
+    note: `scanned PDF: page(s) ${shown.join(", ")} of ${rendered.pageCount} rendered as images`
+  };
+  if (missing > 0) {
+    // Say how to get the rest rather than deciding for the caller: one more
+    // page of a document that matters is worth the tokens, a dozen pages of
+    // one that does not is not. Only explain the default to a caller that did
+    // not already choose.
+    result.note += asked
+      ? `. The other ${missing} were not rendered; pass pages to include them, up to ${MAX_RENDER_PAGES} per call`
+      : `. The default is the first ${DEFAULT_RENDER_PAGES}; pass pages (for example "3-5", or "all" for every page, up to ${MAX_RENDER_PAGES}) for the rest`;
+  }
+  return [
+    json(result),
+    ...rendered.images.map((image) => ({ type: "image", data: image.base64, mimeType: image.mimeType }))
+  ];
+}
+
 export async function attachmentContent(attachment, index, {
   maxTextBytes = MAX_ATTACHMENT_TEXT_BYTES,
   maxImageBytes = MAX_ATTACHMENT_IMAGE_BYTES,
   maxBinaryBytes = MAX_ATTACHMENT_BINARY_BYTES,
-  maxPdfBytes = MAX_INLINE_PDF_BYTES
+  maxPdfBytes = MAX_INLINE_PDF_BYTES,
+  renderPages,
+  renderWidth
 } = {}) {
   const entry = baseEntry(attachment, index);
   const json = (obj) => ({ type: "text", text: JSON.stringify(obj, null, 2) });
@@ -339,7 +383,11 @@ export async function attachmentContent(attachment, index, {
   if (isPdfAttachment(attachment)) {
     // The PDF's own bytes are never returned: base64 of a PDF is unreadable
     // for a model and the text layer is what it needs.
-    return [json(await withPdfText(entry, attachment, { maxTextBytes, maxPdfBytes }))];
+    const described = await withPdfText(entry, attachment, { maxTextBytes, maxPdfBytes });
+    const { scanned, ...pdfEntry } = described;
+    if (!scanned) return [json(pdfEntry)];
+    // No text layer, so the page images are the only way to read it.
+    return await renderedPdf(pdfEntry, attachment, { renderPages, renderWidth });
   }
 
   if (isInlineTextType(entry.contentType)) {

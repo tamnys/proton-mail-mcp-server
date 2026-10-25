@@ -1,15 +1,15 @@
 // Text extraction from PDF attachments via pdf.js. Only the text layer is
 // read: strings a PDF draws with their positions, rebuilt into lines. A
-// scanned PDF has no text layer and yields nothing; rendering pages to images
-// would need the native canvas package, which is deliberately not installed.
+// scanned PDF has no text layer and yields nothing here; pdf-render.js turns
+// its pages into images instead.
 
-// pdf.js is 16 MB of module; load it on first use, not at server start.
-// On import it warns, via console.warn, that the canvas package is missing
-// and that rendering may be broken. Rendering is never used here, so the
-// warnings are muted for the duration of the import. This server writes
+// pdf.js is 16 MB of module; load it on first use, not at server start. It
+// can warn on import, via console.warn, about its optional canvas package;
+// those warnings are muted for the duration of the import. This server writes
 // nothing else to console.warn, so nothing real is lost in that window.
+// Shared with pdf-render.js so both read and render the same pdf.js instance.
 let pdfjsPromise = null;
-function loadPdfjs() {
+export function loadPdfjs() {
   pdfjsPromise ||= (async () => {
     const originalWarn = console.warn;
     console.warn = () => {};

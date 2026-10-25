@@ -603,7 +603,7 @@ server.tool(
 );
 server.tool(
   "read_email",
-  "Read the full content of a specific email by its UID. Returns headers, the body as plain text, the raw HTML body when the message has one, and the attachments. The plain text comes from the message's text/plain part; when that part is missing or holds only invisible padding, it is derived from the text/html part instead. The bodySource field names the part the text came from ('plain', 'html', or 'none'), not the converter that produced it: a message whose root is text/html has no text/plain part and reports 'html', and 'none' means nothing readable was found, which is how an empty message is distinguishable from a parsing failure. The html field carries the raw HTML for clients that prefer to render it themselves, or null when the message has no HTML part. Inline images stay as cid: references that match the listed attachments rather than being expanded into the HTML, and any oversized base64 payload embedded by the sender is replaced by a marker naming what was dropped. Each attachment is listed with its index, filename, contentType, size, disposition and cid. Text attachments (text/*, .ics) up to 64 kB carry their decoded content inline; calendar parts additionally carry a parsed 'calendar' object with the method and each event's summary, start, end, timezone, location, organizer and attendees. PDF attachments carry the text of their text layer in 'content' (up to 64 kB, page by page) plus 'pages' and 'pdfInfo'; a scanned PDF without a text layer says so in 'note'. For meeting invites, appointment confirmations and invoices the real detail usually lives in these attachments rather than in the body, so consult them before answering. Use read_attachment to fetch an image or an oversized attachment in full. " + MESSAGE_ID_HINT,
+  "Read the full content of a specific email by its UID. Returns headers, the body as plain text, the raw HTML body when the message has one, and the attachments. The plain text comes from the message's text/plain part; when that part is missing or holds only invisible padding, it is derived from the text/html part instead. The bodySource field names the part the text came from ('plain', 'html', or 'none'), not the converter that produced it: a message whose root is text/html has no text/plain part and reports 'html', and 'none' means nothing readable was found, which is how an empty message is distinguishable from a parsing failure. The html field carries the raw HTML for clients that prefer to render it themselves, or null when the message has no HTML part. Inline images stay as cid: references that match the listed attachments rather than being expanded into the HTML, and any oversized base64 payload embedded by the sender is replaced by a marker naming what was dropped. Each attachment is listed with its index, filename, contentType, size, disposition and cid. Text attachments (text/*, .ics) up to 64 kB carry their decoded content inline; calendar parts additionally carry a parsed 'calendar' object with the method and each event's summary, start, end, timezone, location, organizer and attendees. PDF attachments carry the text of their text layer in 'content' (up to 64 kB, page by page) plus 'pages' and 'pdfInfo'; a scanned PDF has no text layer and says so in 'note', and read_attachment will render its pages as images. For meeting invites, appointment confirmations and invoices the real detail usually lives in these attachments rather than in the body, so consult them before answering. Use read_attachment to fetch an image or an oversized attachment in full. " + MESSAGE_ID_HINT,
   {
     ...messageRefShape("to read"),
     folder: z.string().default("INBOX").describe("Folder the email is in (default: INBOX)")
@@ -641,14 +641,15 @@ server.tool(
 );
 server.tool(
   "read_attachment",
-  "Fetch one attachment of an email, selected by the index or filename reported by read_email. Text attachments (text/*, .ics) are returned decoded, with parsed calendar events for .ics; PDFs are returned as the text of their text layer, page by page, with the page count and document info, which is how to read an invoice or contract (a scanned PDF has no text layer and is reported as such); images are returned as an image content block so they can be looked at directly, which is how to read an invoice or appointment that was sent as a picture; other binaries are returned as base64 in contentBase64. Size limits: 1 MB for text (truncated beyond that), 8 MB for PDFs, 4 MB for images and 1 MB for other binaries; larger attachments come back with metadata and a note instead. " + MESSAGE_ID_HINT,
+  "Fetch one attachment of an email, selected by the index or filename reported by read_email. Text attachments (text/*, .ics) are returned decoded, with parsed calendar events for .ics; PDFs are returned as the text of their text layer, page by page, with the page count and document info, which is how to read an invoice or contract; a scanned PDF has no text layer, so its pages are rendered and returned as images instead, which keeps the layout intact where OCR would scramble it -- by default the first 2 pages, with the pages argument for the rest; images are returned as an image content block so they can be looked at directly, which is how to read an invoice or appointment that was sent as a picture; other binaries are returned as base64 in contentBase64. Size limits: 1 MB for text (truncated beyond that), 8 MB for PDFs, 4 MB for images and 1 MB for other binaries; larger attachments come back with metadata and a note instead. " + MESSAGE_ID_HINT,
   {
     ...messageRefShape("holding the attachment"),
     folder: z.string().default("INBOX").describe("Folder the email is in (default: INBOX)"),
     index: z.number().int().optional().describe("Zero-based index of the attachment as listed by read_email; takes precedence over filename"),
-    filename: z.string().optional().describe("Filename of the attachment as listed by read_email (case-insensitive)")
+    filename: z.string().optional().describe("Filename of the attachment as listed by read_email (case-insensitive)"),
+    pages: z.string().optional().describe('Which pages of a scanned PDF to render as images: a number, a range like "2-5", a comma-separated mix, or "all". Defaults to the first 2; at most 20 per call. Ignored for anything else')
   },
-  async ({ uid, messageId, folder, index, filename }) => withImapClient(async (client) => {
+  async ({ uid, messageId, folder, index, filename, pages }) => withImapClient(async (client) => {
       const lock = await client.getMailboxLock(folder);
       try {
         const rawMessage = await fetchMessage(client, folder, { uid, messageId });
@@ -656,7 +657,7 @@ server.tool(
         const parsed = await simpleParser(rawMessage.source, { keepCidLinks: true });
         const attachment = findAttachment(parsed, { index, filename });
         const resolvedIndex = parsed.attachments.indexOf(attachment);
-        return { content: await attachmentContent(attachment, resolvedIndex) };
+        return { content: await attachmentContent(attachment, resolvedIndex, { renderPages: pages }) };
       } finally {
         lock.release();
       }

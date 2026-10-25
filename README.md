@@ -55,6 +55,8 @@ Correctness:
 - `save_attachment` writes an attachment to a file on the host, within the
   same `PROTON_BRIDGE_ATTACHMENT_ROOT` limit, refusing to clobber or to follow
   a symlink
+- A scanned PDF, which has no text to extract, is rendered to page images so
+  it can be read at all; the caller chooses how many pages
 - `read_email` inlines text attachments, parses calendar invites and extracts
   the text of PDF attachments, and `read_attachment` fetches images and other
   files, so the date of an appointment or the amount on an invoice are
@@ -218,7 +220,7 @@ shows what is actually there.
 - `list_folders()`
 - `list_emails(folder="INBOX", limit=20)` — each message with `uid`, `messageId` and `hasAttachments`
 - `read_email(uid | messageId, folder="INBOX")` — see [Reading message bodies](#reading-message-bodies)
-- `read_attachment(uid | messageId, folder="INBOX", index, filename)` — see [Attachments](#attachments)
+- `read_attachment(uid | messageId, folder="INBOX", index, filename, pages)` — see [Attachments](#attachments)
 - `save_attachment(uid | messageId, folder="INBOX", index, filename, path, overwrite=false)` — see [Attachments](#attachments)
 - `search_emails(folder="INBOX", from, subject, body, since, before, unseen, limit=20)` — same fields as `list_emails`
 - `create_draft(to, subject, body, html, cc, bcc, attachments)`
@@ -416,7 +418,7 @@ the type:
 | Type | Returned as | Limit |
 | --- | --- | --- |
 | `text/*`, `.ics` | decoded text, plus `calendar` for invites | 1 MB, truncated beyond that |
-| `application/pdf` | the text layer, page by page, with `pages` and `pdfInfo` | 8 MB file, 1 MB of text, first 50 pages |
+| `application/pdf` | the text layer, page by page, with `pages` and `pdfInfo`; a scan with no text layer comes back as page images | 8 MB file, 1 MB of text, first 50 pages; 20 rendered pages |
 | `image/*` | an MCP image content block the model can look at | 4 MB |
 | anything else | base64 in `contentBase64` | 1 MB |
 
@@ -446,12 +448,44 @@ checked. When `PROTON_BRIDGE_ATTACHMENT_ROOT` is set, the destination must lie
 below that root -- the same limit that applies to attaching files to a draft.
 There is no size cap beyond what IMAP itself delivers.
 
-PDF text comes from [pdf.js](https://github.com/mozilla/pdf.js) (`pdfjs-dist`),
-loaded on first use. Only the text layer is read. Rendering pages to images,
-which is what reading a scanned PDF would take, needs pdf.js's optional native
-canvas package; that is a 30 MB platform-specific binary and is deliberately
-left out via `omit=optional` in `.npmrc`. pdf.js 6 requires Node 22.13 or
-newer, which is why `engines` says so.
+### Scanned PDFs
+
+A scanned PDF — anything from a flatbed, a phone camera or an `img2pdf`
+pipeline — has no text layer, so there is no text to extract. `read_attachment`
+renders its pages and returns them as images instead, which the model reads
+directly.
+
+```
+read_attachment(uid: 188, index: 0)
+-> note: "scanned PDF: page(s) 1, 2 of 5 rendered as images. The default is
+          the first 2; pass pages (for example "3-5", or "all" for every page,
+          up to 20) for the rest"
+   + two image blocks
+```
+
+`pages` takes a number, a range like `2-5`, a comma-separated mix, or `all`.
+Pages the document does not have are dropped rather than refused, and no more
+than 20 are rendered in one call. The default of two keeps the common case —
+most scanned mail is a page or two — from costing anything to ask about, while
+leaving the decision about a long document to the caller: a page of something
+that matters is worth the tokens, a dozen pages of something that does not is
+not.
+
+Rendering rather than OCR is deliberate. Tesseract does recover the characters
+from a scan, but not reliably their arrangement: on a test letter it returned
+the right digits attached to the wrong labels, `KvK nummer` and `btw-nummer`
+each separated from their values and broken across lines. That failure is
+invisible — the output reads as ordinary text — and on an invoice it is the
+expensive kind. A rendered page keeps tables, stamps, signatures and
+handwriting as what they are. OCR remains the better tool for building a
+searchable archive, which is a different job from reading one document.
+
+PDF text and rendering both come from [pdf.js](https://github.com/mozilla/pdf.js)
+(`pdfjs-dist`), loaded on first use, with `@napi-rs/canvas` as the canvas it
+draws on. That canvas ships its native binding as a per-platform optional
+package, so `.npmrc` must not omit optional dependencies — without them
+rendering fails at import. pdf.js 6 requires Node 22.13 or newer, which is why
+`engines` says so.
 
 ## Local smoke test
 
