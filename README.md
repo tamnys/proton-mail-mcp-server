@@ -57,6 +57,8 @@ Correctness:
   a symlink
 - A scanned PDF, which has no text to extract, is rendered to page images so
   it can be read at all; the caller chooses how many pages
+- Replies quote the message they answer, in Proton's own markup, instead of
+  leaving that to whoever calls the tool
 - `read_email` inlines text attachments, parses calendar invites and extracts
   the text of PDF attachments, and `read_attachment` fetches images and other
   files, so the date of an appointment or the amount on an invoice are
@@ -224,10 +226,10 @@ shows what is actually there.
 - `save_attachment(uid | messageId, folder="INBOX", index, filename, path, overwrite=false)` — see [Attachments](#attachments)
 - `search_emails(folder="INBOX", from, subject, body, since, before, unseen, limit=20)` — same fields as `list_emails`
 - `create_draft(to, subject, body, html, cc, bcc, attachments)`
-- `create_reply_draft(uid | messageId, folder="INBOX", body, html, replyAll=false, attachments)`
+- `create_reply_draft(uid | messageId, folder="INBOX", body, html, replyAll=false, attachments, quote=true)`
 - `update_draft(uid | messageId, folder="Drafts", to, cc, bcc, subject, body, html, attachments, keepAttachments=true)` — see [Updating a draft](#updating-a-draft)
 - `send_email(to, subject, body, html, cc, bcc, attachments)` — only with `PROTON_BRIDGE_ALLOW_SEND`
-- `reply_to_email(uid | messageId, folder="INBOX", body, html, replyAll=false, attachments)` — only with `PROTON_BRIDGE_ALLOW_SEND`
+- `reply_to_email(uid | messageId, folder="INBOX", body, html, replyAll=false, attachments, quote=true)` — only with `PROTON_BRIDGE_ALLOW_SEND`
 - `move_email(uid | messageId, sourceFolder="INBOX", destinationFolder)`
 - `mark_email(uid | messageId, folder="INBOX", action)`
 - `delete_email(uid | messageId, folder="INBOX")`
@@ -277,6 +279,36 @@ once in a folder, pass the `uid` as well to pick one.
 
 Attaching to drafts always works; `send_email` and `reply_to_email`, and so
 their attachments, exist only with `PROTON_BRIDGE_ALLOW_SEND`.
+
+## Quoting the original in a reply
+
+A reply carries the message it answers, quoted below it, the way any mail
+client writes one. IMAP has no reply operation — a client appends a finished
+message — so there is nothing to delegate this to: Thunderbird, Apple Mail and
+the Proton web app each build their own quote, and so does this.
+
+The markup copies what the Proton web app currently produces, down to the
+`protonmail_quote` classes:
+
+```html
+<div class="protonmail_quote"><br><br>-------- Original Message --------<br>
+On Friday, 10/16/26 at 19:18 Jan Jansen &lt;jan@example.org&gt; wrote:<br>
+<blockquote class="protonmail_quote" type="cite">…the original…</blockquote></div>
+```
+
+Matching those classes is the point: Proton folds a quote it recognises behind
+its "show quoted text" control, so a reply composed here collapses in the
+mailbox like one typed in the web app. The plain-text part gets the same
+quote with `>` prefixes.
+
+The quoted HTML keeps the original's content and styles but loses its document
+wrapper — `<html>`, `<head>`, `<title>`, `<meta>` and any `<script>` — since a
+nested document inside a blockquote renders unpredictably, and scripts have no
+business being passed along.
+
+Pass `quote: false` for a short answer that does not need the original. A
+message with no readable body is not quoted at all, rather than quoting the
+placeholder that `read_email` would have reported.
 
 ## Updating a draft
 

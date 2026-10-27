@@ -9,6 +9,9 @@ import { simpleParser } from "mailparser";
 import {
   plainTextToHtml,
   bodyParts,
+  buildQuote,
+  withQuote,
+  quoteAttribution,
   loadAttachmentFiles,
   assertTotalSize,
   composeDraftUpdate,
@@ -400,4 +403,70 @@ test("bodyParts builds html when the caller supplied none", () => {
     assert.equal(parts.text, "Hoi Jan");
     assert.equal(parts.html, "<p>Hoi Jan</p>");
   }
+});
+
+// A message to reply to, parsed the way the server parses one.
+async function originalMessage({ html, text, name = "Jan Jansen", address = "jan@example.org" } = {}) {
+  const raw = await new Promise((resolve, reject) => {
+    new MailComposer({
+      from: `"${name}" <${address}>`,
+      to: "me@example.com",
+      subject: "Offerte",
+      date: new Date("2026-10-16T19:18:00Z"),
+      text: text ?? "Hallo,\n\nBijgaand de offerte.",
+      ...(html ? { html } : {})
+    }).compile().build((err, msg) => (err ? reject(err) : resolve(msg)));
+  });
+  return simpleParser(raw, { keepCidLinks: true });
+}
+
+test("quoteAttribution follows the wording Proton's own replies use", async () => {
+  const original = await originalMessage();
+  assert.match(quoteAttribution(original), /^On \w+day, \d+\/\d+\/\d\d at \d\d:\d\d Jan Jansen <jan@example\.org> wrote:$/);
+});
+
+test("quoteAttribution copes with a sender that has no name or no date", async () => {
+  assert.match(quoteAttribution({ from: { value: [{ address: "x@example.org" }] } }), /^x@example\.org wrote:$/);
+  assert.match(quoteAttribution({}), /^the sender wrote:$/);
+});
+
+test("buildQuote prefixes the text part and blockquotes the html part", async () => {
+  const original = await originalMessage({ html: "<p>Bijgaand de <b>offerte</b>.</p>" });
+  const quote = buildQuote(original);
+  assert.match(quote.text, /^-------- Original Message --------\n/);
+  assert.match(quote.text, /^> /m);
+  // Proton's own classes, so its interface folds the quote away as usual.
+  assert.match(quote.html, /<div class="protonmail_quote">/);
+  assert.match(quote.html, /<blockquote class="protonmail_quote" type="cite">/);
+  assert.match(quote.html, /<b>offerte<\/b>/);
+});
+
+test("buildQuote drops the document wrapper and head of the quoted html", async () => {
+  const original = await originalMessage({
+    html: '<!doctype html><html><head><title>Factuur</title><meta charset="utf-8"><style>b{color:red}</style></head><body><p>Hoi</p><script>alert(1)</script></body></html>'
+  });
+  const { html } = buildQuote(original);
+  for (const unwanted of [/<!doctype/i, /<html/i, /<head/i, /<body/i, /<title/i, /<meta/i, /<script/i]) {
+    assert.doesNotMatch(html, unwanted);
+  }
+  // Styles stay: without them the quoted mail stops looking like itself.
+  assert.match(html, /<style>b\{color:red\}<\/style>/);
+  assert.match(html, /<p>Hoi<\/p>/);
+});
+
+test("buildQuote returns nothing when there is nothing to quote", async () => {
+  assert.equal(buildQuote(null), null);
+  assert.equal(buildQuote({ from: { value: [{ address: "x@example.org" }] }, text: "   " }), null);
+});
+
+test("withQuote appends to both parts and leaves the reply itself first", async () => {
+  const original = await originalMessage();
+  const parts = withQuote(bodyParts("Dank je.", null), original);
+  assert.match(parts.text, /^Dank je\.\n\n-------- Original Message --------/);
+  assert.match(parts.html, /^<p>Dank je\.<\/p><div class="protonmail_quote">/);
+});
+
+test("withQuote leaves the reply untouched when there is nothing to quote", () => {
+  const parts = bodyParts("Dank je.", null);
+  assert.deepEqual(withQuote(parts, null), parts);
 });

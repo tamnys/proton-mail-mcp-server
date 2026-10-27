@@ -15,7 +15,8 @@ import {
   resolveMessageUid,
   resolveWritePath,
   writeFileGuarded,
-  bodyParts
+  bodyParts,
+  withQuote
 } from "./compose.js";
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -271,8 +272,13 @@ async function fetchParsedMessage(ref, folder) {
     }
   });
 }
-function buildReplyMailOptions(original, body, html, replyAll) {
-  const parts = bodyParts(body, html);
+function buildReplyMailOptions(original, body, html, replyAll, quote = true) {
+  // The quoted original is part of what a reply is; leaving it to the caller
+  // to remember is how it goes missing. Pass quote: false for the short
+  // answers that do not want it.
+  const parts = quote === false
+    ? bodyParts(body, html)
+    : withQuote(bodyParts(body, html), original);
   const fromAddresses = original.from?.value || [];
   const replyTo = fromAddresses.length > 0 ? fromAddresses.map(formatRecipient).join(", ") : formatAddress(original.from);
   let recipients = replyTo;
@@ -829,13 +835,14 @@ server.tool(
     folder: z.string().default("INBOX").describe("Folder the original email is in"),
     body: z.string().describe("Reply body (plain text)"),
     html: z.string().optional().describe("HTML version of the reply. Optional: when omitted, one is generated from the plain text, so the reply always has an HTML part. Pass it to control the formatting yourself"),
+    quote: z.boolean().default(true).describe("Include the message being replied to as a quoted block below the reply, the way a mail client does, in Proton's own format. Default true; pass false for a short answer that does not need the original"),
     replyAll: z.boolean().default(false).describe("Reply to all recipients (default: false)"),
     attachments: attachmentsParam
   },
-  async ({ uid, messageId, folder, body, html, replyAll, attachments }) => {
+  async ({ uid, messageId, folder, body, html, replyAll, attachments, quote }) => {
     const files = await loadAttachments(attachments);
     const original = await fetchParsedMessage({ uid, messageId }, folder);
-    const mailOptions = buildReplyMailOptions(original, body, html, replyAll);
+    const mailOptions = buildReplyMailOptions(original, body, html, replyAll, quote);
     if (files.length) mailOptions.attachments = toMailAttachments(files);
     const draft = await saveDraft(mailOptions);
     return {
@@ -983,13 +990,14 @@ if (ALLOW_SEND) {
       folder: z.string().default("INBOX").describe("Folder the original email is in"),
       body: z.string().describe("Reply body (plain text)"),
       html: z.string().optional().describe("HTML version of the reply. Optional: when omitted, one is generated from the plain text, so the reply always has an HTML part. Pass it to control the formatting yourself"),
+    quote: z.boolean().default(true).describe("Include the message being replied to as a quoted block below the reply, the way a mail client does, in Proton's own format. Default true; pass false for a short answer that does not need the original"),
       replyAll: z.boolean().default(false).describe("Reply to all recipients (default: false)"),
       attachments: attachmentsParam
     },
-    async ({ uid, messageId, folder, body, html, replyAll, attachments }) => {
+    async ({ uid, messageId, folder, body, html, replyAll, attachments, quote }) => {
       const files = await loadAttachments(attachments);
       const original = await fetchParsedMessage({ uid, messageId }, folder);
-      const mailOptions = buildReplyMailOptions(original, body, html, replyAll);
+      const mailOptions = buildReplyMailOptions(original, body, html, replyAll, quote);
       if (files.length) mailOptions.attachments = toMailAttachments(files);
       const info = await sendMail(mailOptions);
       return {

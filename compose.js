@@ -1,7 +1,7 @@
 import { lstat, readFile, realpath, stat, writeFile } from "fs/promises";
 import { basename, dirname, isAbsolute, join, relative } from "path";
 import { homedir } from "os";
-import { htmlToPlainText } from "./body.js";
+import { htmlToPlainText, selectBody } from "./body.js";
 
 // Proton refuses messages whose attachments add up to more than about 25 MB.
 // Checking up front gives a usable error instead of a draft that will not
@@ -63,6 +63,99 @@ export function assertTotalSize(items, maxBytes = MAX_TOTAL_ATTACHMENT_BYTES) {
 // before anything is read, so a bad path or an oversized set fails the whole
 // call and no draft is created. `existing` lists attachments the message
 // already carries ({ filename, size }), which count towards the size cap.
+// --- Quoting the message being replied to ---------------------------------
+//
+// IMAP has no notion of a reply: a client appends a finished message, so the
+// quoted original has to be built here, exactly as Thunderbird or the Proton
+// web app build theirs. The markup below copies what the web app currently
+// produces, down to the protonmail_quote classes, so a reply composed through
+// this server folds away behind "show quoted text" in Proton the same way one
+// typed in the web app does.
+
+const QUOTE_SEPARATOR = "-------- Original Message --------";
+
+// "On Friday, 10/16/26 at 19:18" -- the web app's own wording and ordering.
+function quoteDate(date) {
+  if (!(date instanceof Date) || Number.isNaN(date.getTime())) return null;
+  const weekday = new Intl.DateTimeFormat("en-US", { weekday: "long" }).format(date);
+  const parts = new Intl.DateTimeFormat("en-US", {
+    month: "numeric", day: "numeric", year: "2-digit"
+  }).format(date);
+  const time = new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit", minute: "2-digit", hour12: false
+  }).format(date);
+  return `${weekday}, ${parts} at ${time}`;
+}
+
+// "On <date> Name <address> wrote:", or the shorter form when either is
+// missing, so a message without a date or a sender still gets an attribution.
+export function quoteAttribution(original) {
+  const sender = original?.from?.value?.[0];
+  const name = sender?.name?.trim();
+  const address = sender?.address?.trim();
+  const who = name && address ? `${name} <${address}>` : address || name || "the sender";
+  const when = quoteDate(original?.date);
+  return when ? `On ${when} ${who} wrote:` : `${who} wrote:`;
+}
+
+// Keep the original's markup but not its document wrapper: a nested <html> or
+// <body> inside a blockquote is invalid and clients render it unpredictably.
+// Head content goes with it -- a stray <title> or <meta> renders as nothing or
+// as text depending on the client, and Proton's own quotes start at the first
+// real element. Scripts go too: they do nothing in mail and should not be
+// passed along. Styles stay, since the quoted mail needs them to look like
+// itself.
+function quotableHtml(html) {
+  return String(html)
+    .replace(/<!doctype[^>]*>/gi, "")
+    .replace(/<script\b[^>]*>[\s\S]*?<\/script>/gi, "")
+    .replace(/<title\b[^>]*>[\s\S]*?<\/title>/gi, "")
+    .replace(/<(?:meta|link|base)\b[^>]*\/?>/gi, "")
+    .replace(/<\/?(?:html|head|body)\b[^>]*>/gi, "")
+    .trim();
+}
+
+// The quoted original as both parts: ">" prefixes for text, a blockquote for
+// html. Returns null when there is nothing worth quoting.
+export function buildQuote(original) {
+  if (!original) return null;
+  const body = selectBody(original);
+  // A message with no readable body reports a notice rather than text; that
+  // notice is ours, not the sender's, so it is not something to quote back.
+  const originalText = body.bodySource === "none" ? "" : body.text;
+  const suppliedHtml = typeof original.html === "string" && original.html.trim().length > 0
+    ? quotableHtml(original.html)
+    : "";
+  // Decide on the content, not on the generated markup: an empty body still
+  // produces a <p></p>, which would make an empty quote look like a real one.
+  if (suppliedHtml === "" && originalText.trim() === "") return null;
+
+  const attribution = quoteAttribution(original);
+  const originalHtml = suppliedHtml || plainTextToHtml(originalText);
+
+  const quotedText = originalText
+    .split(/\r?\n/)
+    .map((line) => (line.length > 0 ? `> ${line}` : ">"))
+    .join("\n");
+  const escapedAttribution = attribution.replace(/[&<>]/g, (c) => HTML_ESCAPES[c]);
+
+  return {
+    text: `${QUOTE_SEPARATOR}\n${attribution}\n${quotedText}`,
+    html: `<div class="protonmail_quote"><br><br>${QUOTE_SEPARATOR}<br>${escapedAttribution}<br>` +
+          `<blockquote class="protonmail_quote" type="cite">${originalHtml}</blockquote></div>`
+  };
+}
+
+// Append the quoted original to a reply's body parts.
+export function withQuote(parts, original) {
+  const quote = buildQuote(original);
+  if (!quote) return parts;
+  return {
+    text: `${parts.text}\n\n${quote.text}`,
+    html: `${parts.html}${quote.html}`
+  };
+}
+
 // Returns nodemailer attachment objects plus their size.
 export async function loadAttachmentFiles(specs = [], { root, existing = [] } = {}) {
   if (!specs.length) return [];
