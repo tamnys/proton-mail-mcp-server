@@ -4,6 +4,7 @@ import nodemailer from "nodemailer";
 import MailComposer from "nodemailer/lib/mail-composer/index.js";
 import { simpleParser } from "mailparser";
 import { selectBody } from "./body.js";
+import { isEnabled, isLoopbackHost, imapConnectionOptions } from "./connection.js";
 import { describeAttachments, findAttachment, attachmentContent, hasAttachments } from "./attachments.js";
 import {
   loadAttachmentFiles,
@@ -24,6 +25,17 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { readFileSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+var FILE_SETTINGS = [
+  "PROTON_BRIDGE_HOST",
+  "PROTON_BRIDGE_IMAP_PORT",
+  "PROTON_BRIDGE_IMAP_SECURE",
+  "PROTON_BRIDGE_SMTP_HOST",
+  "PROTON_BRIDGE_SMTP_PORT",
+  "PROTON_BRIDGE_SMTP_SECURE",
+  "PROTON_BRIDGE_ALLOW_SEND",
+  "PROTON_BRIDGE_READ_ONLY",
+  "PROTON_BRIDGE_ATTACHMENT_ROOT"
+];
 function loadConfig() {
   let username = process.env.PROTON_BRIDGE_USERNAME;
   let password = process.env.PROTON_BRIDGE_PASSWORD;
@@ -43,13 +55,9 @@ function loadConfig() {
         }
         if (key === "PROTON_BRIDGE_USERNAME" && !username) username = val;
         if (key === "PROTON_BRIDGE_PASSWORD" && !password) password = val;
-        if (key === "PROTON_BRIDGE_HOST") process.env.PROTON_BRIDGE_HOST = val;
-        if (key === "PROTON_BRIDGE_IMAP_PORT") process.env.PROTON_BRIDGE_IMAP_PORT = val;
-        if (key === "PROTON_BRIDGE_SMTP_HOST") process.env.PROTON_BRIDGE_SMTP_HOST = val;
-        if (key === "PROTON_BRIDGE_SMTP_PORT") process.env.PROTON_BRIDGE_SMTP_PORT = val;
-        if (key === "PROTON_BRIDGE_SMTP_SECURE") process.env.PROTON_BRIDGE_SMTP_SECURE = val;
-        if (key === "PROTON_BRIDGE_ALLOW_SEND") process.env.PROTON_BRIDGE_ALLOW_SEND = val;
-        if (key === "PROTON_BRIDGE_ATTACHMENT_ROOT") process.env.PROTON_BRIDGE_ATTACHMENT_ROOT = val;
+        // The environment wins: a stale line in the file must not switch off
+        // PROTON_BRIDGE_READ_ONLY or TLS that the client configuration set.
+        if (FILE_SETTINGS.includes(key) && process.env[key] === undefined) process.env[key] = val;
       }
     } catch {
     }
@@ -60,12 +68,14 @@ var creds = loadConfig();
 var CONFIG = {
   host: process.env.PROTON_BRIDGE_HOST || "127.0.0.1",
   imapPort: parseInt(process.env.PROTON_BRIDGE_IMAP_PORT || "1143", 10),
+  // Off for Bridge and gmx (STARTTLS); on for Gmail, which only takes 993.
+  imapSecure: isEnabled(process.env.PROTON_BRIDGE_IMAP_SECURE),
   // Bridge serves IMAP and SMTP from the same host; a hosted provider
   // usually does not (imap.gmx.net vs mail.gmx.net). Falls back to the
   // IMAP host, which keeps the single-host Bridge setup working unchanged.
   smtpHost: process.env.PROTON_BRIDGE_SMTP_HOST || process.env.PROTON_BRIDGE_HOST || "127.0.0.1",
   smtpPort: parseInt(process.env.PROTON_BRIDGE_SMTP_PORT || "1025", 10),
-  smtpSecure: /^(1|true|yes)$/i.test(process.env.PROTON_BRIDGE_SMTP_SECURE || ""),
+  smtpSecure: isEnabled(process.env.PROTON_BRIDGE_SMTP_SECURE),
   username: creds.username,
   password: creds.password
 };
@@ -75,7 +85,11 @@ if (!CONFIG.username || !CONFIG.password) {
   );
   process.exit(1);
 }
-var ALLOW_SEND = /^(1|true|yes)$/i.test(process.env.PROTON_BRIDGE_ALLOW_SEND || "");
+var ALLOW_SEND = isEnabled(process.env.PROTON_BRIDGE_ALLOW_SEND);
+// Read-only leaves out every tool that changes the mailbox or sends mail, so
+// mail that tells Claude to move, delete or answer something has nothing to
+// call. It wins over PROTON_BRIDGE_ALLOW_SEND.
+var READ_ONLY = isEnabled(process.env.PROTON_BRIDGE_READ_ONLY);
 // Optional: when set, attachments may only be taken from below this directory.
 var ATTACHMENT_ROOT = process.env.PROTON_BRIDGE_ATTACHMENT_ROOT || null;
 var IMAP_IDLE_TIMEOUT_MS = parseInt(process.env.PROTON_BRIDGE_IDLE_TIMEOUT_MS || "300000", 10);
@@ -95,22 +109,12 @@ function unrefTimer(timer) {
     timer.unref();
   }
 }
-function isLoopbackHost(host) {
-  const h = (host || "").toLowerCase();
-  return h === "localhost" || h === "::1" || h.startsWith("127.");
-}
 function createImapClient() {
   const client = new ImapFlow({
-    host: CONFIG.host,
-    port: CONFIG.imapPort,
-    secure: false,
+    ...imapConnectionOptions(CONFIG),
     auth: {
       user: CONFIG.username,
       pass: CONFIG.password
-    },
-    tls: {
-      // Bridge uses a self-signed cert; only skip validation for local Bridge
-      rejectUnauthorized: !isLoopbackHost(CONFIG.host)
     },
     logger: false
   });
@@ -524,6 +528,23 @@ var server = new McpServer({
   name: "proton-mail",
   version: "0.1.0"
 });
+// Registers a tool that changes the mailbox or sends mail; in read-only mode
+// it is not registered at all, so the client never sees it.
+function mutatingTool(...args) {
+  if (!READ_ONLY) server.tool(...args);
+}
+// save_attachment leaves the mailbox alone but writes to this machine, which a
+// prompt-injected mail could aim at any file. Read-only keeps it only when
+// PROTON_BRIDGE_ATTACHMENT_ROOT fences in where it may write.
+function fileWritingTool(...args) {
+  if (!READ_ONLY || ATTACHMENT_ROOT) server.tool(...args);
+}
+// The reading tools open their folder with EXAMINE in read-only mode, so the
+// IMAP server itself refuses any change to it. The other instances keep the
+// plain SELECT they always used.
+function readLock(client, folder) {
+  return client.getMailboxLock(folder, { readOnly: READ_ONLY });
+}
 server.tool(
   "list_folders",
   "List all mailbox folders (INBOX, Sent, Drafts, Trash, etc.)",
@@ -563,7 +584,7 @@ server.tool(
   },
   async ({ folder, limit }) => withImapClient(async (client) => {
       const effectiveLimit = Math.min(limit || 20, 50);
-      const lock = await client.getMailboxLock(folder);
+      const lock = await readLock(client, folder);
       try {
         const messages = [];
         const status = client.mailbox;
@@ -617,7 +638,7 @@ server.tool(
     folder: z.string().default("INBOX").describe("Folder the email is in (default: INBOX)")
   },
   async ({ uid, messageId, folder }) => withImapClient(async (client) => {
-      const lock = await client.getMailboxLock(folder);
+      const lock = await readLock(client, folder);
       try {
         const rawMessage = await fetchMessage(client, folder, { uid, messageId });
         // keepCidLinks stops mailparser from inlining every referenced
@@ -658,7 +679,7 @@ server.tool(
     pages: z.string().optional().describe('Which pages of a scanned PDF to render as images: a number, a range like "2-5", a comma-separated mix, or "all". Defaults to the first 2; at most 20 per call. Ignored for anything else')
   },
   async ({ uid, messageId, folder, index, filename, pages }) => withImapClient(async (client) => {
-      const lock = await client.getMailboxLock(folder);
+      const lock = await readLock(client, folder);
       try {
         const rawMessage = await fetchMessage(client, folder, { uid, messageId });
         // Parsed the same way as read_email so the attachment indexes line up.
@@ -671,7 +692,7 @@ server.tool(
       }
     })
 );
-server.tool(
+fileWritingTool(
   "save_attachment",
   "Write one attachment of an email to a file on the machine running this server, selected by the index or filename reported by read_email. Use this rather than read_attachment when the bytes have to end up on disk -- collecting invoice PDFs, for instance -- since read_attachment returns only a PDF's text layer and hands other binaries back as base64. The destination must be an absolute path (~ is expanded) whose directory already exists; an existing file is refused unless overwrite is true, and the server never writes through a symlink. When PROTON_BRIDGE_ATTACHMENT_ROOT is set, the destination must lie below that directory, the same limit that applies to attaching files. Returns the path written plus the attachment's filename, size and contentType. " + MESSAGE_ID_HINT,
   {
@@ -686,7 +707,7 @@ server.tool(
       // Resolved before the fetch, so a bad path fails without first pulling
       // the whole message off the server.
       const target = await resolveWritePath(path, { root: ATTACHMENT_ROOT });
-      const lock = await client.getMailboxLock(folder);
+      const lock = await readLock(client, folder);
       try {
         const rawMessage = await fetchMessage(client, folder, { uid, messageId });
         // Parsed the same way as read_email so the attachment indexes line up.
@@ -725,7 +746,7 @@ server.tool(
     limit: z.number().default(20).describe("Max results (default 20, max 50)")
   },
   async ({ folder, from, subject, body, since, before, unseen, limit }) => withImapClient(async (client) => {
-      const lock = await client.getMailboxLock(folder);
+      const lock = await readLock(client, folder);
       try {
         const searchCriteria = {};
         if (from) searchCriteria.from = from;
@@ -780,7 +801,7 @@ server.tool(
       }
     })
 );
-server.tool(
+mutatingTool(
   "create_draft",
   "Create a draft email in the Drafts folder, optionally with file attachments. Nothing is sent; the user reviews and sends it from their own mail client. To change a draft afterwards, use update_draft rather than creating another one.",
   {
@@ -827,7 +848,7 @@ server.tool(
     };
   }
 );
-server.tool(
+mutatingTool(
   "create_reply_draft",
   "Create a reply to an existing email as a draft in the Drafts folder, written with threading headers (In-Reply-To, References), optionally with file attachments. Nothing is sent; the user reviews and sends it from their own mail client. " + DRAFT_THREADING_NOTE + " " + MESSAGE_ID_HINT,
   {
@@ -867,7 +888,7 @@ server.tool(
     };
   }
 );
-server.tool(
+mutatingTool(
   "update_draft",
   "Change an existing draft. Only the fields passed change; everything else stays as it was. Pass an empty string to clear to, cc or bcc. A new html without a new body also updates the plain-text part from it; a new body without a new html turns the draft into plain text. Existing attachments are kept unless keepAttachments is false; new ones are added. IMAP cannot edit a message in place, so the draft is stored anew and the old copy is then removed: the result reports oldUid and newUid, and newUid is the one to use from then on. Only messages flagged as drafts can be replaced; received mail is refused. Work in the Drafts folder (the default) rather than All Mail, where a freshly stored draft may not show up right away. " + MESSAGE_ID_HINT,
   {
@@ -937,7 +958,7 @@ server.tool(
   }
 );
 if (ALLOW_SEND) {
-  server.tool(
+  mutatingTool(
     "send_email",
     "Compose and send a new email. Supports plain text and HTML body, CC, BCC and file attachments.",
     {
@@ -982,7 +1003,7 @@ if (ALLOW_SEND) {
       };
     }
   );
-  server.tool(
+  mutatingTool(
     "reply_to_email",
     "Reply to an existing email, optionally with file attachments. Reads the original to set proper headers (In-Reply-To, References). " + MESSAGE_ID_HINT,
     {
@@ -1021,7 +1042,7 @@ if (ALLOW_SEND) {
     }
   );
 }
-server.tool(
+mutatingTool(
   "move_email",
   "Move an email to a different folder (e.g., move to Trash, Archive). " + MESSAGE_ID_HINT,
   {
@@ -1056,7 +1077,7 @@ server.tool(
       }
     })
 );
-server.tool(
+mutatingTool(
   "mark_email",
   "Mark an email as read/unread or flagged/unflagged. " + MESSAGE_ID_HINT,
   {
@@ -1108,7 +1129,7 @@ async function findSpecialUsePath(client, specialUse, fallback) {
   }
   return fallback;
 }
-server.tool(
+mutatingTool(
   "delete_email",
   "Delete an email by moving it to the Trash folder. " + MESSAGE_ID_HINT,
   {

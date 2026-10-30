@@ -43,6 +43,10 @@ Security and safety:
 - Sending is off by default: the server creates drafts for review, and
   `send_email` and `reply_to_email` are exposed only with
   `PROTON_BRIDGE_ALLOW_SEND`
+- A read-only mode (`PROTON_BRIDGE_READ_ONLY`) leaves out every tool that
+  changes the mailbox, for an account the client should only read
+- IMAP can use implicit TLS (`PROTON_BRIDGE_IMAP_SECURE`), which Gmail
+  requires
 - Deleting moves a message to Trash rather than expunging it irreversibly
 
 Correctness:
@@ -119,7 +123,9 @@ PROTON_BRIDGE_SMTP_PORT="1025"
 ```
 
 Only the username and password are required if you use Bridge's default local
-ports. The password is the Bridge password shown in the Proton Mail Bridge
+ports. The file is read only when the username or password is missing from
+the environment, so an instance configured entirely through `env` ignores it.
+A setting present in both places takes the environment's value. The password is the Bridge password shown in the Proton Mail Bridge
 app, not your Proton account password.
 
 By default the server connects to SMTP with STARTTLS (and requires the
@@ -127,6 +133,13 @@ upgrade to succeed), which matches Proton Bridge's default security setting.
 If you switched Bridge's SMTP connection mode to SSL (implicit TLS), set
 `PROTON_BRIDGE_SMTP_SECURE="true"` (in the environment or in the credentials
 file).
+
+IMAP likewise starts in plain text and must be upgraded with STARTTLS, as
+Bridge (1143) and gmx (143) expect; a server that does not offer the upgrade
+is refused rather than spoken to unencrypted. For a provider that only offers implicit TLS --
+Gmail, on 993 -- set `PROTON_BRIDGE_IMAP_SECURE="true"` together with the
+port. It is a switch of its own rather than something guessed from the port
+number.
 
 ## Sending is disabled by default
 
@@ -137,6 +150,28 @@ file); without it, the MCP client does not even see them. Instead, the
 `create_draft` and `create_reply_draft` tools save a message to your Drafts
 folder over IMAP. Bridge syncs it to Proton, so it shows up in your regular
 mail clients where you can review, edit, and send it yourself.
+
+## Read-only mode
+
+`PROTON_BRIDGE_READ_ONLY="true"` (in the environment or in the credentials
+file) turns an instance into a reader. `create_draft`, `create_reply_draft`,
+`update_draft`, `move_email`, `mark_email` and `delete_email` are then not
+registered at all, so the MCP client never sees them, and neither are
+`send_email` and `reply_to_email`: read-only wins over
+`PROTON_BRIDGE_ALLOW_SEND`. The reading tools open folders with IMAP
+`EXAMINE` instead of `SELECT`, so the server itself refuses any change made
+through that session as well.
+
+`save_attachment` does not touch the mailbox but writes to this machine, so
+in read-only mode it exists only when `PROTON_BRIDGE_ATTACHMENT_ROOT` limits
+where it may write. `read_attachment`, which returns the content instead of
+writing it, is always there.
+
+Use it for an account whose password grants more than the client should be
+able to do. The risk is not only a leaked password: a mail that arrives with
+instructions meant for the model ("move all invoices to Trash") is read by
+the same model that holds the tools. Without the tools there is nothing to
+misuse.
 
 ## Connect it to an MCP client
 
@@ -211,6 +246,34 @@ page names the servers for your account -- `gmx.com` for an international
 account, `gmx.net` for a German one -- so take the hostnames from there
 rather than from this example.
 
+### Gmail
+
+Gmail (including Google Workspace) needs three things to differ from gmx:
+
+```json
+"gmail": {
+  "command": "node",
+  "args": ["/ABSOLUTE/PATH/TO/server.js"],
+  "env": {
+    "PROTON_BRIDGE_USERNAME": "you@example.com",
+    "PROTON_BRIDGE_PASSWORD": "your-app-password",
+    "PROTON_BRIDGE_HOST": "imap.gmail.com",
+    "PROTON_BRIDGE_IMAP_PORT": "993",
+    "PROTON_BRIDGE_IMAP_SECURE": "true",
+    "PROTON_BRIDGE_READ_ONLY": "true"
+  }
+}
+```
+
+- Gmail accepts IMAP only on `imap.gmail.com:993` with implicit TLS; port 143
+  with STARTTLS is not offered. Hence `PROTON_BRIDGE_IMAP_SECURE`. The
+  certificate is validated as for any non-loopback host.
+- The password is a Google *app password*, not the account password. Creating
+  one requires 2-Step Verification, is not possible with Advanced Protection
+  or security-key-only 2SV, and a Workspace administrator can disable it.
+- An app password opens the whole mailbox, read and write, so this example
+  runs read-only. Leave it that way unless the instance has to write.
+
 Folder names are the provider's own. `Drafts` and `Trash` are located through
 the IMAP SPECIAL-USE flags when the server advertises them, falling back to
 those English names otherwise; if your provider uses localised names and
@@ -233,6 +296,10 @@ shows what is actually there.
 - `move_email(uid | messageId, sourceFolder="INBOX", destinationFolder)`
 - `mark_email(uid | messageId, folder="INBOX", action)`
 - `delete_email(uid | messageId, folder="INBOX")`
+
+With `PROTON_BRIDGE_READ_ONLY` only the first six remain, `save_attachment`
+among them only when `PROTON_BRIDGE_ATTACHMENT_ROOT` is set; see
+[Read-only mode](#read-only-mode).
 
 `uid | messageId` means either one identifies the message; see
 [Referring to messages](#referring-to-messages).
@@ -479,6 +546,13 @@ symlink, so a link cannot redirect a write out of the directory that was
 checked. When `PROTON_BRIDGE_ATTACHMENT_ROOT` is set, the destination must lie
 below that root -- the same limit that applies to attaching files to a draft.
 There is no size cap beyond what IMAP itself delivers.
+
+`read_attachment` and `save_attachment` fetch the whole message (its full
+RFC822 source) before picking out the attachment, and the size limits above
+are applied only after that. A very large message -- a mail with a 20 MB
+video next to the PDF you want -- is downloaded and parsed in full, which can
+be slow and takes memory in proportion. Fetching a single MIME part instead
+would avoid this; it is not done yet.
 
 ### Scanned PDFs
 
