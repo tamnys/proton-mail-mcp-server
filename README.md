@@ -151,6 +151,21 @@ file); without it, the MCP client does not even see them. Instead, the
 folder over IMAP. Bridge syncs it to Proton, so it shows up in your regular
 mail clients where you can review, edit, and send it yourself.
 
+## Ordinary hosted mailboxes (DirectAdmin, cPanel, shared hosting)
+
+Three settings make an instance fit a mailbox on plain hosting:
+
+- `PROTON_BRIDGE_CREDENTIALS_FILE` points the instance at its own credentials
+  file instead of `~/.proton-bridge-credentials`, so each account keeps its
+  password in its own file (`chmod 600`) rather than in the client config.
+- `PROTON_BRIDGE_FROM_NAME` sets the display name in the From header
+  (`Hielke Kramer <hielke@example.com>`); without it the bare address is used.
+- `PROTON_BRIDGE_SAVE_SENT="true"` appends a copy of every sent message to the
+  Sent folder over IMAP. Bridge and Gmail do this themselves; Exim and most
+  hosted SMTP servers do not, so without it sent mail is missing from Sent.
+  The mail has already gone out when the copy is made, so a failure is
+  reported in the tool result (`sentCopy.error`) instead of failing the call.
+
 ## Read-only mode
 
 `PROTON_BRIDGE_READ_ONLY="true"` (in the environment or in the credentials

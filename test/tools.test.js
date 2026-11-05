@@ -77,3 +77,15 @@ test("a credentials file cannot switch off PROTON_BRIDGE_READ_ONLY set in the en
   const home = await homeWithCredentials(t, ["PROTON_BRIDGE_READ_ONLY=false", "PROTON_BRIDGE_ALLOW_SEND=true"]);
   assert.deepEqual(await toolNames(t, { PROTON_BRIDGE_READ_ONLY: "true" }, { home }), [...READING].sort());
 });
+
+test("PROTON_BRIDGE_CREDENTIALS_FILE points a second account at its own credentials file", async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), "proton-mcp-creds-"));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const file = join(dir, "other-account");
+  await writeFile(file, ["PROTON_BRIDGE_USERNAME=other@example.com", "PROTON_BRIDGE_PASSWORD=not-a-real-password", "PROTON_BRIDGE_ALLOW_SEND=true"].join("\n"));
+  // The home has no credentials file, so the server only starts if it reads this one.
+  const home = await mkdtemp(join(tmpdir(), "proton-mcp-home-"));
+  t.after(() => rm(home, { recursive: true, force: true }));
+  const names = await toolNames(t, { PROTON_BRIDGE_CREDENTIALS_FILE: file }, { home });
+  assert.deepEqual(names, [...READING, ...SAVING, ...CHANGING, ...SENDING].sort());
+});

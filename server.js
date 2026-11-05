@@ -34,13 +34,18 @@ var FILE_SETTINGS = [
   "PROTON_BRIDGE_SMTP_SECURE",
   "PROTON_BRIDGE_ALLOW_SEND",
   "PROTON_BRIDGE_READ_ONLY",
-  "PROTON_BRIDGE_ATTACHMENT_ROOT"
+  "PROTON_BRIDGE_ATTACHMENT_ROOT",
+  "PROTON_BRIDGE_FROM_NAME",
+  "PROTON_BRIDGE_SAVE_SENT"
 ];
 function loadConfig() {
   let username = process.env.PROTON_BRIDGE_USERNAME;
   let password = process.env.PROTON_BRIDGE_PASSWORD;
   if (!username || !password) {
-    const configPath = join(homedir(), ".proton-bridge-credentials");
+    // One file per account: a second instance (another mailbox) points
+    // PROTON_BRIDGE_CREDENTIALS_FILE at its own file, so no password has to
+    // sit in the client configuration.
+    const configPath = process.env.PROTON_BRIDGE_CREDENTIALS_FILE || join(homedir(), ".proton-bridge-credentials");
     try {
       const raw = readFileSync(configPath, "utf-8");
       for (const line of raw.split("\n")) {
@@ -77,8 +82,14 @@ var CONFIG = {
   smtpPort: parseInt(process.env.PROTON_BRIDGE_SMTP_PORT || "1025", 10),
   smtpSecure: isEnabled(process.env.PROTON_BRIDGE_SMTP_SECURE),
   username: creds.username,
-  password: creds.password
+  password: creds.password,
+  // Display name in the From header ("Hielke Kramer <hielke@...>"); without
+  // it the bare address is used, as before.
+  fromName: process.env.PROTON_BRIDGE_FROM_NAME || ""
 };
+function fromHeader() {
+  return CONFIG.fromName ? { name: CONFIG.fromName, address: CONFIG.username } : CONFIG.username;
+}
 if (!CONFIG.username || !CONFIG.password) {
   console.error(
     "Error: Proton Bridge credentials not found.\nEither set PROTON_BRIDGE_USERNAME and PROTON_BRIDGE_PASSWORD environment variables,\nor create ~/.proton-bridge-credentials with:\n\n  PROTON_BRIDGE_USERNAME=your-email@proton.me\n  PROTON_BRIDGE_PASSWORD=your-bridge-password\n"
@@ -90,6 +101,10 @@ var ALLOW_SEND = isEnabled(process.env.PROTON_BRIDGE_ALLOW_SEND);
 // mail that tells Claude to move, delete or answer something has nothing to
 // call. It wins over PROTON_BRIDGE_ALLOW_SEND.
 var READ_ONLY = isEnabled(process.env.PROTON_BRIDGE_READ_ONLY);
+// Proton Bridge and Gmail file a sent message in Sent themselves; a plain
+// hosted SMTP server (DirectAdmin/Exim, most shared hosting) does not, so the
+// mail would only exist at the recipient. On, a copy is appended over IMAP.
+var SAVE_SENT = isEnabled(process.env.PROTON_BRIDGE_SAVE_SENT);
 // Optional: when set, attachments may only be taken from below this directory.
 var ATTACHMENT_ROOT = process.env.PROTON_BRIDGE_ATTACHMENT_ROOT || null;
 var IMAP_IDLE_TIMEOUT_MS = parseInt(process.env.PROTON_BRIDGE_IDLE_TIMEOUT_MS || "300000", 10);
@@ -308,7 +323,7 @@ function buildReplyMailOptions(original, body, html, replyAll, quote = true) {
     original.messageId
   ].flat().filter(Boolean).join(" ");
   const mailOptions = {
-    from: CONFIG.username,
+    from: fromHeader(),
     to: recipients,
     subject: subjectLine,
     text: parts.text,
@@ -317,6 +332,22 @@ function buildReplyMailOptions(original, body, html, replyAll, quote = true) {
     references: references || void 0
   };
   return mailOptions;
+}
+// Files a copy of a message that was just sent in the Sent folder. The mail
+// has already gone out, so a failure here is reported, not thrown: retrying
+// the tool would send it twice.
+async function fileSentCopy(mailOptions, info) {
+  if (!SAVE_SENT) return void 0;
+  try {
+    const raw = await buildRawMessage({ ...mailOptions, messageId: info.messageId }, { keepBcc: true });
+    return await withImapClient(async (client) => {
+      const sentPath = await findSpecialUsePath(client, "\\Sent", "Sent");
+      const appended = await client.append(sentPath, raw, ["\\Seen"]);
+      return { folder: sentPath, uid: appended?.uid ?? null };
+    });
+  } catch (error) {
+    return { error: `Sent, but no copy was saved in Sent: ${error?.message || error}` };
+  }
 }
 async function saveDraft(mailOptions) {
   const raw = await buildRawMessage(mailOptions, { keepBcc: true });
@@ -391,6 +422,8 @@ function getSmtpTransport() {
   return smtpTransport;
 }
 async function sendMail(mailOptions) {
+  // Fixed before sending so the copy filed in Sent carries the same Date.
+  if (!mailOptions.date) mailOptions.date = new Date();
   const transport2 = getSmtpTransport();
   try {
     const info = await transport2.sendMail(mailOptions);
@@ -817,7 +850,7 @@ mutatingTool(
     const files = await loadAttachments(attachments);
     const parts = bodyParts(body, html);
     const mailOptions = {
-      from: CONFIG.username,
+      from: fromHeader(),
       to,
       subject,
       text: parts.text,
@@ -922,7 +955,7 @@ mutatingTool(
           parsed,
           { to, cc, bcc, subject, body, html, keepAttachments },
           files,
-          { fallbackFrom: CONFIG.username }
+          { fallbackFrom: fromHeader() }
         );
         assertTotalSize(allAttachments);
         const raw = await buildRawMessage(mailOptions, { keepBcc: true });
@@ -974,7 +1007,7 @@ if (ALLOW_SEND) {
       const files = await loadAttachments(attachments);
       const parts = bodyParts(body, html);
       const mailOptions = {
-        from: CONFIG.username,
+        from: fromHeader(),
         to,
         subject,
         text: parts.text,
@@ -984,6 +1017,7 @@ if (ALLOW_SEND) {
       if (bcc) mailOptions.bcc = bcc;
       if (files.length) mailOptions.attachments = toMailAttachments(files);
       const info = await sendMail(mailOptions);
+      const sentCopy = await fileSentCopy(mailOptions, info);
       return {
         content: [
           {
@@ -991,6 +1025,7 @@ if (ALLOW_SEND) {
             text: JSON.stringify(
               withAttachmentSummary({
                 success: true,
+                sentCopy,
                 messageId: info.messageId,
                 to,
                 subject
@@ -1021,6 +1056,7 @@ if (ALLOW_SEND) {
       const mailOptions = buildReplyMailOptions(original, body, html, replyAll, quote);
       if (files.length) mailOptions.attachments = toMailAttachments(files);
       const info = await sendMail(mailOptions);
+      const sentCopy = await fileSentCopy(mailOptions, info);
       return {
         content: [
           {
@@ -1028,6 +1064,7 @@ if (ALLOW_SEND) {
             text: JSON.stringify(
               withAttachmentSummary({
                 success: true,
+                sentCopy,
                 messageId: info.messageId,
                 to: mailOptions.to,
                 subject: mailOptions.subject,
