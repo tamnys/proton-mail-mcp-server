@@ -1,0 +1,26 @@
+{
+  "name": "proton-mail-mcp-server",
+  "version": "0.1.0",
+  "description": "MCP server for Proton Mail via Proton Bridge (IMAP/SMTP)",
+  "type": "module",
+  "bin": {
+    "proton-mail-mcp-server": "server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@napi-rs/canvas": "1.0.13",
+    "html-to-text": "10.0.0",
+    "imapflow": "1.4.8",
+    "mailparser": "3.9.14",
+    "nodemailer": "9.0.3",
+    "pdfjs-dist": "6.3.289",
+    "zod": "4.4.3"
+  }
+}
